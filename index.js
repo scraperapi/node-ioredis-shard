@@ -1,8 +1,8 @@
 const assert = require('assert');
 const HashRing = require('hashring');
-const redis = require('redis');
+const Redis = require('ioredis');
 const step = require('step');
-const _ = require('lodash');
+const lodash = require('lodash');
 const async = require('async');
 
 module.exports = function RedisShard(options) {
@@ -12,9 +12,8 @@ module.exports = function RedisShard(options) {
   const self = {};
   const clients = {};
   options.servers.forEach((server) => {
-    const fields = server.split(/:/);
     const clientOptions = options.clientOptions || {};
-    const client = redis.createClient(parseInt(fields[1], 10), fields[0], clientOptions);
+    const client = new Redis(server, clientOptions);
     if (options.database) {
       client.select(options.database, () => {});
     }
@@ -25,9 +24,9 @@ module.exports = function RedisShard(options) {
   });
 
   const servers = {};
-  for (const key in clients) {
+  Object.keys(clients).forEach((key) => {
     servers[key] = 1; // balanced ring for now
-  }
+  });
   self.ring = new HashRing(servers);
 
   // All of these commands have 'key' as their first parameter
@@ -43,82 +42,84 @@ module.exports = function RedisShard(options) {
     'zrevrangebyscore', 'zrevrank', 'zscore'
   ];
   SHARDABLE.forEach((command) => {
-    self[command] = function () {
-      const node = self.ring.get(arguments[0]);
+    self[command] = (...args) => {
+      const node = self.ring.get(args[0]);
       const client = clients[node];
-      client[command](...arguments);
+      client[command](...args);
     };
   });
 
   // mget
-  self.mget = function () {
-    const keys = _.first(arguments);
-    const callback = _.last(arguments);
-    const mapping = _.reduce(keys, (acc, key) => {
+  self.mget = async (...args) => {
+    const keys = lodash.first(args);
+    const callback = lodash.last(args);
+    const mapping = lodash.reduce(keys, (acc, key) => {
       const node = self.ring.get(key);
-      if (_.has(acc, node)) {
+      if (lodash.has(acc, node)) {
         acc[node].push(key);
       } else {
         acc[node] = [key];
       }
       return acc;
     }, {});
-    const nodes = _.keys(mapping);
+    const nodes = lodash.keys(mapping);
     async.map(nodes, (node, next) => {
-      const keys = mapping[node];
+      const nodeKeys = mapping[node];
       const client = clients[node];
       //      console.log(node, keys.length);
-      client.mget(keys, next);
+      client.mget(nodeKeys, next);
     }, (err, results) => {
       if (err) {
         return callback(err);
       }
-      const keyHash = _.reduce(nodes, (acc, node, index) => {
-        const keys = mapping[node];
-        const values = _.get(results, [index], []);
-        return _.assign(acc, _.zipObject(keys, values));
+      const keyHash = lodash.reduce(nodes, (acc, node, index) => {
+        const nodeKeys = mapping[node];
+        const values = lodash.get(results, [index], []);
+        return lodash.assign(acc, lodash.zipObject(nodeKeys, values));
       }, {});
-      return callback(err, _.map(keys, key => keyHash[key]));
+      return callback(err, lodash.map(keys, key => keyHash[key]));
     });
   };
 
   // keys
-  self.keys = function () {
-    const key_regex = _.first(arguments);
-    const callback = _.last(arguments);
-    const nodes = _.keys(self.ring.vnodes);
+  self.keys = async (...args) => {
+    const keyRegex = lodash.first(args);
+    const callback = lodash.last(args);
+    const nodes = lodash.keys(self.ring.vnodes);
     async.map(nodes, (node, next) => {
       const client = clients[node];
-      client.keys(key_regex, next);
+      client.keys(keyRegex, next);
     }, (err, results) => {
       if (err) {
         return callback(err);
       }
       let keys = [];
-      _.map(results, node_keys => keys = _.concat(keys, node_keys));
+      // eslint-disable-next-line no-return-assign
+      lodash.map(results, nodeKeys => keys = lodash.concat(keys, nodeKeys));
       return callback(err, keys);
     });
   };
 
   // mset
-  self.mset = function () {
-    const keys = _.first(arguments);
-    const callback = _.last(arguments);
-    const mapping = _.reduce(keys, (acc, key, index) => {
+  self.mset = async (...args) => {
+    const keys = lodash.first(args);
+    const callback = lodash.last(args);
+    const mapping = lodash.reduce(keys, (acc, key, index) => {
       const keyCheck = index % 2 ? keys[index - 1] : key;
       const node = self.ring.get(keyCheck);
-      if (_.has(acc, node)) {
+      if (lodash.has(acc, node)) {
         acc[node].push(key);
       } else {
         acc[node] = [key];
       }
       return acc;
     }, {});
-    const nodes = _.keys(mapping);
+    const nodes = lodash.keys(mapping);
     async.map(nodes, (node, next) => {
-      const keys = mapping[node];
+      const nodeKeys = mapping[node];
       const client = clients[node];
-      client.mset(keys, next);
+      client.mset(nodeKeys, next);
+      // eslint-disable-next-line no-unused-vars
     }, (err, responses) => {
       if (err) {
         return callback(err);
@@ -138,39 +139,40 @@ module.exports = function RedisShard(options) {
     'unsubscribe', 'unwatch', 'zinterstore', 'zunionstore'
   ];
   UNSHARDABLE.forEach((command) => {
-    self[command] = function () {
+    self[command] = () => {
       throw new Error(`${command} is not shardable`);
     };
   });
 
   // This is the tricky part - pipeline commands to multiple servers
   self.multi = function Multi() {
-    const self = {};
+    const multiSelf = {};
     const multis = {};
     const interlachen = [];
 
     // Setup chainable shardable commands
     SHARDABLE.forEach((command) => {
-      self[command] = function () {
-        const node = self.ring.get(arguments[0]);
+      multiSelf[command] = (...args) => {
+        const node = self.ring.get(args[0]);
         let multi = multis[node];
         if (!multi) {
-          multi = multis[node] = clients[node].multi();
+          multis[node] = clients[node].multi();
+          multi = multis[node];
         }
         interlachen.push(node);
-        multi[command](...arguments);
-        return self;
+        multi[command](...args);
+        return multiSelf;
       };
     });
 
     UNSHARDABLE.forEach((command) => {
-      self[command] = function () {
+      self[command] = () => {
         throw new Error(`${command} is not supported`);
       };
     });
 
     // Exec the pipeline and interleave the results
-    self.exec = function (callback) {
+    multiSelf.exec = (callback) => {
       const nodes = Object.keys(multis);
       step(
         function run() {
@@ -179,6 +181,7 @@ module.exports = function RedisShard(options) {
             multis[node].exec(group());
           });
         },
+        // eslint-disable-next-line consistent-return
         (error, groups) => {
           if (error) { return callback(error); }
           assert(nodes.length === groups.length, 'wrong number of responses');
@@ -192,27 +195,27 @@ module.exports = function RedisShard(options) {
         }
       );
     };
-    return self; // Multi()
+    return multiSelf; // Multi()
   };
 
 
-  self.on = function (event, listener) {
+  self.on = (event, listener) => {
     options.servers.forEach((server) => {
-      clients[server].on(event, function () {
+      clients[server].on(event, (...args) => {
         // append server as last arg passed to listener
-        const args = Array.prototype.slice.call(arguments).concat(server);
-        listener(...args);
+        const largs = Array.prototype.slice.call(args).concat(server);
+        listener(...largs);
       });
     });
   };
 
   // Note: listener will fire once per shard, not once per cluster
-  self.once = function (event, listener) {
+  self.once = (event, listener) => {
     options.servers.forEach((server) => {
-      clients[server].once(event, function () {
+      clients[server].once(event, (...args) => {
         // append server as last arg passed to listener
-        const args = Array.prototype.slice.call(arguments).concat(server);
-        listener(...args);
+        const largs = Array.prototype.slice.call(args).concat(server);
+        listener(...largs);
       });
     });
   };
